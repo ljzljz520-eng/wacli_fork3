@@ -9,6 +9,9 @@ import (
 	"github.com/openclaw/wacli/internal/store/storedb"
 )
 
+// GroupParticipantsTable is the group roster table name.
+const GroupParticipantsTable = "group_participants"
+
 func (d *DB) UpsertGroup(jid, name, ownerJID string, created time.Time) error {
 	return d.q.UpsertGroup(storeCtx(), storedb.UpsertGroupParams{
 		Jid:       jid,
@@ -46,11 +49,15 @@ func (d *DB) MarkGroupLeft(jid string, leftAt time.Time) error {
 	})
 }
 
+func (d *DB) ListJoinedGroupJIDs() ([]string, error) {
+	return d.q.ListJoinedGroupJIDs(storeCtx())
+}
+
 func (d *DB) MarkGroupsMissingFrom(joined map[string]bool, leftAt time.Time) error {
 	if leftAt.IsZero() {
 		leftAt = nowUTC()
 	}
-	joinedJIDs, err := d.q.ListJoinedGroupJIDs(storeCtx())
+	joinedJIDs, err := d.ListJoinedGroupJIDs()
 	if err != nil {
 		return err
 	}

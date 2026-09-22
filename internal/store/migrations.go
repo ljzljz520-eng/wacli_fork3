@@ -40,6 +40,7 @@ var schemaMigrations = []migration{
 	{version: 24, name: "app state recovery intents", up: migrateAppStateRecoveryIntents},
 	{version: 25, name: "message locations", up: migrateMessageLocations},
 	{version: 26, name: "message identity indexes and selective fts updates", up: migrateMessageIdentityIndexes},
+	{version: 27, name: "event ledger", up: migrateEventLedger},
 }
 
 func migrateMessageIdentityIndexes(d *DB) error {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/openclaw/wacli/internal/app"
 	"github.com/openclaw/wacli/internal/out"
 	"github.com/openclaw/wacli/internal/store"
 	"github.com/openclaw/wacli/internal/syscontacts"
@@ -52,7 +53,7 @@ and phones.`,
 			defer closeApp(a, lk)
 
 			if clear {
-				return runContactsSystemClear(a.DB(), dryRun, flags.asJSON)
+				return runContactsSystemClear(a, dryRun, flags.asJSON)
 			}
 
 			systemContacts, err := readSystemContacts(ctx, input)
@@ -85,7 +86,7 @@ and phones.`,
 
 			applied := 0
 			for _, m := range matches {
-				if err := a.DB().SetSystemName(m.JID, m.SystemName); err != nil {
+				if err := a.SetSystemNameWithLedger(ctx, m.JID, m.SystemName); err != nil {
 					fmt.Fprintf(os.Stderr, "warning: failed to set system name for %s: %v\n", m.JID, err)
 					continue
 				}
@@ -116,7 +117,8 @@ func readSystemContacts(ctx context.Context, input string) ([]syscontacts.Contac
 	return syscontacts.ReadSystem(ctx)
 }
 
-func runContactsSystemClear(db *store.DB, dryRun, asJSON bool) error {
+func runContactsSystemClear(a *app.App, dryRun, asJSON bool) error {
+	db := a.DB()
 	count, err := db.CountSystemNames()
 	if err != nil {
 		return err
@@ -128,7 +130,7 @@ func runContactsSystemClear(db *store.DB, dryRun, asJSON bool) error {
 		fmt.Fprintf(os.Stdout, "Would clear %d system contact name(s).\n", count)
 		return nil
 	}
-	cleared, err := db.ClearAllSystemNames()
+	cleared, err := a.ClearSystemNamesWithLedger(context.Background())
 	if err != nil {
 		return err
 	}

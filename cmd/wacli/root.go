@@ -97,6 +97,7 @@ func execute(args []string) error {
 	rootCmd.AddCommand(newProfileCmd(&flags))
 	rootCmd.AddCommand(newDocsCmd(&flags))
 	rootCmd.AddCommand(newStoreCmd(&flags))
+	rootCmd.AddCommand(newLedgerCmd(&flags))
 
 	rootCmd.SetArgs(args)
 	if err := rootCmd.Execute(); err != nil {

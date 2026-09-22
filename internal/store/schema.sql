@@ -210,3 +210,121 @@ CREATE TABLE IF NOT EXISTS poll_votes (
 );
 
 CREATE INDEX IF NOT EXISTS idx_poll_votes_poll ON poll_votes(chat_jid, poll_msg_id);
+
+-- Append-only protocol event ledger. Rows may never be updated or deleted:
+-- state changes (scrub, identity resolution, supersession) are expressed as
+-- new events, and readers compute the effective set.
+CREATE TABLE IF NOT EXISTS ledger_events (
+    seq            INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id       TEXT NOT NULL UNIQUE,
+    source         TEXT NOT NULL,
+    event_type     TEXT NOT NULL,
+    wa_key         TEXT NOT NULL DEFAULT '',
+    chat_jid       TEXT NOT NULL DEFAULT '',
+    msg_id         TEXT NOT NULL DEFAULT '',
+    sender_jid     TEXT NOT NULL DEFAULT '',
+    server_ts      INTEGER NOT NULL DEFAULT 0,
+    event_ts       INTEGER NOT NULL DEFAULT 0,
+    received_at    INTEGER NOT NULL,
+    raw_hash       TEXT NOT NULL,
+    parser_version TEXT NOT NULL,
+    rules_version  TEXT NOT NULL,
+    dedup_key      TEXT NOT NULL,
+    causal_refs    TEXT NOT NULL DEFAULT '[]',
+    causes         TEXT NOT NULL DEFAULT '[]',
+    batch_id       INTEGER NOT NULL DEFAULT 0,
+    flags          INTEGER NOT NULL DEFAULT 0,
+    -- Snapshot/tombstone payload for events without retained raw bytes
+    -- (legacy_snapshot, scrub) so projectors remain replayable.
+    snapshot       TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_ledger_dedup_key ON ledger_events(dedup_key);
+CREATE INDEX IF NOT EXISTS idx_ledger_wa_key ON ledger_events(wa_key);
+CREATE INDEX IF NOT EXISTS idx_ledger_chat_jid ON ledger_events(chat_jid);
+CREATE INDEX IF NOT EXISTS idx_ledger_msg_id ON ledger_events(msg_id);
+CREATE INDEX IF NOT EXISTS idx_ledger_event_ts ON ledger_events(event_ts);
+
+-- Raw protocol envelope bytes, kept separate from the immutable event rows so
+-- payload purge can erase content (delete this row + append a scrub event)
+-- without mutating ledger_events.
+CREATE TABLE IF NOT EXISTS ledger_raw (
+    event_id  TEXT PRIMARY KEY,
+    encoding  TEXT NOT NULL,
+    raw_bytes BLOB NOT NULL,
+    FOREIGN KEY (event_id) REFERENCES ledger_events(event_id)
+);
+
+CREATE TABLE IF NOT EXISTS projector_checkpoints (
+    view              TEXT PRIMARY KEY,
+    last_seq          INTEGER NOT NULL,
+    projector_version TEXT NOT NULL,
+    updated_at        INTEGER NOT NULL
+);
+
+-- Per-view projection mode: shadow (write only to shadow tables) or live.
+CREATE TABLE IF NOT EXISTS ledger_view_state (
+    view TEXT PRIMARY KEY,
+    mode TEXT NOT NULL DEFAULT 'shadow'
+);
+
+CREATE TABLE IF NOT EXISTS ledger_batches (
+    batch_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at INTEGER NOT NULL,
+    source     TEXT NOT NULL DEFAULT ''
+);
+
+-- Late causal resolution: links appended after the event row when its target
+-- arrives later. Insert-only; event.causes covers refs resolved at append time.
+CREATE TABLE IF NOT EXISTS ledger_causal_links (
+    event_id  TEXT NOT NULL,
+    ref_index INTEGER NOT NULL,
+    target_id TEXT NOT NULL,
+    PRIMARY KEY (event_id, ref_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ledger_links_target ON ledger_causal_links(target_id);
+
+-- INSERT OR REPLACE deletes rows without firing DELETE triggers, so guard the
+-- BEFORE INSERT path as well. The trigger fires before REPLACE resolves its
+-- uniqueness conflict and therefore blocks the overwrite.
+CREATE TRIGGER IF NOT EXISTS ledger_events_no_replace
+BEFORE INSERT ON ledger_events
+WHEN EXISTS (SELECT 1 FROM ledger_events WHERE event_id = NEW.event_id)
+BEGIN
+    SELECT RAISE(ABORT, 'ledger event_id already exists: ledger_events is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS ledger_events_no_update
+BEFORE UPDATE ON ledger_events
+BEGIN
+    SELECT RAISE(ABORT, 'ledger_events is append-only: express state changes as new events');
+END;
+
+CREATE TRIGGER IF NOT EXISTS ledger_events_no_delete
+BEFORE DELETE ON ledger_events
+BEGIN
+    SELECT RAISE(ABORT, 'ledger_events is append-only: deletes are not allowed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS ledger_links_no_replace
+BEFORE INSERT ON ledger_causal_links
+WHEN EXISTS (
+    SELECT 1 FROM ledger_causal_links
+    WHERE event_id = NEW.event_id AND ref_index = NEW.ref_index
+)
+BEGIN
+    SELECT RAISE(ABORT, 'causal link already exists: ledger_causal_links is insert-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS ledger_links_no_update
+BEFORE UPDATE ON ledger_causal_links
+BEGIN
+    SELECT RAISE(ABORT, 'ledger_causal_links is insert-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS ledger_links_no_delete
+BEFORE DELETE ON ledger_causal_links
+BEGIN
+    SELECT RAISE(ABORT, 'ledger_causal_links is insert-only');
+END;

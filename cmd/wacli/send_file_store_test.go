@@ -40,6 +40,10 @@ type fakeSendFileApp struct {
 func (f *fakeSendFileApp) WA() app.WAClient { return f.wa }
 func (f *fakeSendFileApp) DB() *store.DB    { return f.db }
 
+func (f *fakeSendFileApp) UpsertStatusMessageWithLedger(_ context.Context, p store.UpsertStatusMessageParams) error {
+	return f.db.UpsertStatusMessage(p)
+}
+
 func newSendFileFixture(t *testing.T) (*fakeSendFileApp, *store.DB, string) {
 	t.Helper()
 	db, err := store.Open(filepath.Join(t.TempDir(), "wacli.db"))

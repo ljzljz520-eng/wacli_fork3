@@ -52,7 +52,7 @@ func newGroupsInfoCmd(flags *rootFlags) *cobra.Command {
 				return fmt.Errorf("group info not found for %s", gjid.String())
 			}
 			if info != nil {
-				_ = persistGroupInfo(ctx, a.DB(), a.WA(), info)
+				_ = persistGroupInfo(ctx, a, info)
 			}
 
 			if flags.asJSON {
@@ -116,7 +116,7 @@ func newGroupsRenameCmd(flags *rootFlags) *cobra.Command {
 				return err
 			}
 			if info, err := a.WA().GetGroupInfo(ctx, gjid); err == nil && info != nil {
-				_ = persistGroupInfo(ctx, a.DB(), a.WA(), info)
+				_ = persistGroupInfo(ctx, a, info)
 			}
 			if flags.asJSON {
 				return out.WriteJSON(os.Stdout, map[string]any{"jid": gjid.String(), "name": name})
@@ -164,7 +164,7 @@ func newGroupsLeaveCmd(flags *rootFlags) *cobra.Command {
 			if err := a.WA().LeaveGroup(ctx, gjid); err != nil {
 				return err
 			}
-			_ = a.DB().MarkGroupLeft(gjid.String(), time.Now().UTC())
+			_ = a.MarkGroupLeftWithLedger(ctx, gjid.String(), time.Now().UTC())
 			if flags.asJSON {
 				return out.WriteJSON(os.Stdout, map[string]any{"jid": gjid.String(), "left": true})
 			}

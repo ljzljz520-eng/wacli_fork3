@@ -100,6 +100,15 @@ type ParsedMessage struct {
 	// UnhandledPayload names the populated waE2E.Message field when parsing
 	// extracted no content at all. Empty when the message was understood.
 	UnhandledPayload string
+	// RawEnvelope is the original protocol envelope for this message: the
+	// waE2E.Message for live events and the waWeb.WebMessageInfo for history
+	// events. Used by the append-only ledger; nil for messages built ad hoc.
+	RawEnvelope any
+	// IngestSource is the ledger source label (live|history|on_demand_history).
+	IngestSource string
+	// FromFullSync marks history messages delivered in an initial bootstrap
+	// (full) history sync.
+	FromFullSync bool
 }
 
 func ParseLiveMessage(evt *events.Message) ParsedMessage {
@@ -121,6 +130,8 @@ func ParseLiveMessage(evt *events.Message) ParsedMessage {
 	}
 
 	markUnhandledPayload(extractWAProto(evt.Message, &msg), &msg)
+	msg.RawEnvelope = evt.RawMessage
+	msg.IngestSource = "live"
 	return msg
 }
 
@@ -153,6 +164,8 @@ func ParseHistoryMessage(chatJID string, hist *waProto.WebMessageInfo) ParsedMes
 	if hist.GetMessage() != nil {
 		markUnhandledPayload(extractWAProto(hist.GetMessage(), &pm), &pm)
 	}
+	pm.RawEnvelope = hist
+	pm.IngestSource = "history"
 	return pm
 }
 

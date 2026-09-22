@@ -8,6 +8,9 @@ import (
 	"github.com/openclaw/wacli/internal/store/storedb"
 )
 
+// StarredTable is the star-marker table name.
+const StarredTable = "starred"
+
 type SetStarredParams struct {
 	ChatJID   string
 	MsgID     string

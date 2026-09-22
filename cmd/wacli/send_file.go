@@ -70,6 +70,7 @@ type sendFileOutcome struct {
 func sendFile(ctx context.Context, a interface {
 	WA() app.WAClient
 	DB() *store.DB
+	UpsertStatusMessageWithLedger(context.Context, store.UpsertStatusMessageParams) error
 }, to types.JID, filePath string, opts sendFileOptions) (sendFileOutcome, error) {
 	mediaAs, err := validateSendFileMediaOptions(opts.mediaAs, opts.ptt)
 	if err != nil {
@@ -179,7 +180,7 @@ func sendFile(ctx context.Context, a interface {
 	// without turning a delivered message into a reported failure.
 	var storeErr error
 	if to == types.StatusBroadcastJID {
-		storeErr = a.DB().UpsertStatusMessage(store.UpsertStatusMessageParams{
+		storeErr = a.UpsertStatusMessageWithLedger(ctx, store.UpsertStatusMessageParams{
 			MsgID:         id,
 			Timestamp:     now,
 			FromMe:        true,

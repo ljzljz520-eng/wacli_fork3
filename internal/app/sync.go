@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/openclaw/wacli/internal/ledger"
 	"github.com/openclaw/wacli/internal/store"
 	"github.com/openclaw/wacli/internal/wa"
 	"go.mau.fi/whatsmeow"
@@ -147,7 +148,7 @@ func (a *App) Sync(ctx context.Context, opts SyncOptions) (SyncResult, error) {
 	enqueueMedia := func(chatJID, msgID string) {}
 	if opts.DownloadMedia {
 		mediaQ = newMediaQueue(512)
-		enqueueMedia = newMediaEnqueuer(syncCtx, mediaQ)
+		enqueueMedia = a.wrapMediaEnqueuer(syncCtx, newMediaEnqueuer(syncCtx, mediaQ))
 	}
 
 	if opts.DownloadMedia {
@@ -167,7 +168,7 @@ func (a *App) Sync(ctx context.Context, opts SyncOptions) (SyncResult, error) {
 	enqueueWebhook := func(syncWebhookEvent) {}
 	if syncWebhookEnabled(opts) {
 		webhookJobs = make(chan syncWebhookEvent, 512)
-		enqueueWebhook = a.newSyncWebhookEnqueuer(syncCtx, webhookJobs)
+		enqueueWebhook = a.wrapWebhookEnqueuer(syncCtx, a.newSyncWebhookEnqueuer(syncCtx, webhookJobs))
 		stopWebhook = a.runSyncWebhookWorker(syncCtx, opts, webhookJobs)
 		defer stopWebhook()
 	}
@@ -386,6 +387,19 @@ func chatKind(chat types.JID) string {
 func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error {
 	pm.Chat = a.canonicalStoreJID(ctx, pm.Chat)
 	chatJID := canonicalJIDString(pm.Chat)
+
+	// Canonicalize the sender up front so the append-only ledger event (written
+	// before any materialized table) carries the same JID as the views.
+	senderJID := pm.SenderJID
+	if pm.SenderJID != "" {
+		if jid, err := types.ParseJID(pm.SenderJID); err == nil {
+			senderJID = a.canonicalStoreJID(ctx, jid).String()
+		}
+	}
+	if err := a.ingestMessageEvent(ctx, chatJID, senderJID, pm); err != nil {
+		return err
+	}
+
 	chatName := a.wa.ResolveChatName(ctx, pm.Chat, pm.PushName)
 	if pm.Chat != types.StatusBroadcastJID {
 		if err := a.db.UpsertChat(chatJID, chatKind(pm.Chat), chatName, pm.Timestamp); err != nil {
@@ -397,7 +411,7 @@ func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error
 	if pm.Chat.Server == types.DefaultUserServer {
 		chat := canonicalJID(pm.Chat)
 		if info, err := a.wa.GetContact(ctx, chat); err == nil {
-			_ = a.db.UpsertContact(
+			a.UpsertContactWithLedger(ctx,
 				chat.String(),
 				chat.User,
 				info.PushName,
@@ -414,7 +428,6 @@ func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error
 	} else if s := strings.TrimSpace(pm.PushName); s != "" && s != "-" {
 		senderName = s
 	}
-	senderJID := pm.SenderJID
 	if pm.SenderJID != "" {
 		if jid, err := types.ParseJID(pm.SenderJID); err == nil {
 			contactJID := a.canonicalStoreJID(ctx, jid)
@@ -423,7 +436,7 @@ func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error
 				if name := wa.BestContactName(info); name != "" {
 					senderName = name
 				}
-				_ = a.db.UpsertContact(
+				a.UpsertContactWithLedger(ctx,
 					contactJID.String(),
 					contactJID.User,
 					info.PushName,
@@ -458,7 +471,7 @@ func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error
 	}
 
 	if pm.Chat == types.StatusBroadcastJID {
-		return a.db.UpsertStatusMessage(store.UpsertStatusMessageParams{
+		return a.UpsertStatusMessageWithLedger(ctx, store.UpsertStatusMessageParams{
 			MsgID:         pm.ID,
 			Timestamp:     pm.Timestamp,
 			FromMe:        pm.FromMe,
@@ -535,12 +548,12 @@ func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error
 		if pm.Call.Timestamp.IsZero() {
 			pm.Call.Timestamp = pm.Timestamp
 		}
-		if err := a.storeParsedCallEvent(ctx, *pm.Call, chatName, senderName); err != nil {
+		if err := a.storeParsedCallEvent(ctx, *pm.Call, chatName, senderName, ledger.SourceLive); err != nil {
 			return err
 		}
 	}
 	if pm.StarredKnown {
-		return a.db.SetStarred(store.SetStarredParams{
+		return a.SetStarredWithLedger(ctx, ledger.SourceLive, store.SetStarredParams{
 			ChatJID:   chatJID,
 			MsgID:     pm.ID,
 			SenderJID: senderJID,
@@ -552,7 +565,7 @@ func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error
 	return nil
 }
 
-func (a *App) storeParsedCallEvent(ctx context.Context, call wa.ParsedCallEvent, chatName, senderName string) error {
+func (a *App) storeParsedCallEvent(ctx context.Context, call wa.ParsedCallEvent, chatName, senderName, source string) error {
 	call.Chat = a.canonicalStoreJID(ctx, call.Chat)
 	chatJID := canonicalJIDString(call.Chat)
 	if chatJID == "" {
@@ -595,7 +608,7 @@ func (a *App) storeParsedCallEvent(ctx context.Context, call wa.ParsedCallEvent,
 		})
 	}
 
-	return a.db.UpsertCallEvent(store.UpsertCallEventParams{
+	params := store.UpsertCallEventParams{
 		ChatJID:      chatJID,
 		ChatName:     chatName,
 		SenderJID:    senderJID,
@@ -611,14 +624,48 @@ func (a *App) storeParsedCallEvent(ctx context.Context, call wa.ParsedCallEvent,
 		DurationSecs: call.DurationSecs,
 		Timestamp:    call.Timestamp,
 		Participants: participants,
-	})
+	}
+	if ledgerEnabled() {
+		canonicalParticipants := make([]ledger.CanonicalCallParticipant, 0, len(params.Participants))
+		for _, p := range params.Participants {
+			canonicalParticipants = append(canonicalParticipants, ledger.CanonicalCallParticipant{
+				JID: p.JID, Outcome: p.Outcome,
+			})
+		}
+		c := ledger.CanonicalCallEvent{
+			ChatJID:      params.ChatJID,
+			ChatName:     params.ChatName,
+			SenderJID:    params.SenderJID,
+			SenderName:   params.SenderName,
+			CallID:       params.CallID,
+			MsgID:        params.MsgID,
+			EventType:    params.EventType,
+			Direction:    params.Direction,
+			Media:        params.Media,
+			Outcome:      params.Outcome,
+			Reason:       params.Reason,
+			CallType:     params.CallType,
+			DurationSecs: params.DurationSecs,
+			TS:           params.Timestamp.Unix(),
+			Participants: canonicalParticipants,
+		}
+		if err := a.appendCallEvent(ctx, source, c); err != nil {
+			return err
+		}
+	}
+	return a.db.UpsertCallEvent(params)
 }
 
-func (a *App) deleteParsedCallEvents(ctx context.Context, deleted wa.ParsedCallDelete) error {
+func (a *App) deleteParsedCallEvents(ctx context.Context, source string, deleted wa.ParsedCallDelete) error {
 	chat := a.canonicalStoreJID(ctx, deleted.Chat)
 	chatJID := canonicalJIDString(chat)
 	if chatJID == "" {
 		return fmt.Errorf("call chat JID is required")
+	}
+	if ledgerEnabled() {
+		if err := a.appendCallDelete(ctx, source, chatJID, deleted.Direction); err != nil {
+			return err
+		}
 	}
 	_, err := a.db.DeleteCallEvents(store.DeleteCallEventsParams{
 		ChatJID:   chatJID,

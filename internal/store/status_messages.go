@@ -1,10 +1,39 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"strings"
 	"time"
 )
+
+// StatusMessagesTable is the status broadcast messages table name.
+const StatusMessagesTable = "status_messages"
+
+const statusMessageUpsertSQL = `
+		INSERT INTO status_messages(
+			msg_id, ts, from_me, sender_jid, sender_name, text,
+			media_type, media_caption, filename, mime_type, direct_path,
+			media_key, file_sha256, file_enc_sha256, file_length,
+			background_color, font
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(msg_id) DO UPDATE SET
+			ts=excluded.ts,
+			from_me=excluded.from_me,
+			sender_jid=excluded.sender_jid,
+			sender_name=excluded.sender_name,
+			text=excluded.text,
+			media_type=excluded.media_type,
+			media_caption=excluded.media_caption,
+			filename=excluded.filename,
+			mime_type=excluded.mime_type,
+			direct_path=excluded.direct_path,
+			media_key=excluded.media_key,
+			file_sha256=excluded.file_sha256,
+			file_enc_sha256=excluded.file_enc_sha256,
+			file_length=excluded.file_length,
+			background_color=excluded.background_color,
+			font=excluded.font`
 
 type StatusMessage struct {
 	RowID           int64
@@ -48,33 +77,19 @@ type UpsertStatusMessageParams struct {
 }
 
 func (d *DB) UpsertStatusMessage(p UpsertStatusMessageParams) error {
-	_, err := d.sql.Exec(`
-		INSERT INTO status_messages(
-			msg_id, ts, from_me, sender_jid, sender_name, text,
-			media_type, media_caption, filename, mime_type, direct_path,
-			media_key, file_sha256, file_enc_sha256, file_length,
-			background_color, font
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(msg_id) DO UPDATE SET
-			ts=excluded.ts,
-			from_me=excluded.from_me,
-			sender_jid=excluded.sender_jid,
-			sender_name=excluded.sender_name,
-			text=excluded.text,
-			media_type=excluded.media_type,
-			media_caption=excluded.media_caption,
-			filename=excluded.filename,
-			mime_type=excluded.mime_type,
-			direct_path=excluded.direct_path,
-			media_key=excluded.media_key,
-			file_sha256=excluded.file_sha256,
-			file_enc_sha256=excluded.file_enc_sha256,
-			file_length=excluded.file_length,
-			background_color=excluded.background_color,
-			font=excluded.font
-	`, p.MsgID, unix(p.Timestamp), boolToInt(p.FromMe), nullIfEmpty(p.SenderJID), nullIfEmpty(p.SenderName), nullIfEmpty(p.Text),
-		nullIfEmpty(p.MediaType), nullIfEmpty(p.MediaCaption), nullIfEmpty(p.Filename), nullIfEmpty(p.MimeType), nullIfEmpty(p.DirectPath),
-		p.MediaKey, p.FileSHA256, p.FileEncSHA256, int64(p.FileLength), nullIfEmpty(p.BackgroundColor), int64(p.Font))
+	return d.UpsertStatusMessageTarget(storeCtx(), d.sql, StatusMessagesTable, p)
+}
+
+// UpsertStatusMessageTarget applies the status upsert to the target table
+// (active or shadow) through ex.
+func (d *DB) UpsertStatusMessageTarget(ctx context.Context, ex QueryExecer, table string, p UpsertStatusMessageParams) error {
+	query := RetargetTable(statusMessageUpsertSQL, StatusMessagesTable, table)
+	_, err := ex.ExecContext(ctx, query, p.MsgID, unix(p.Timestamp), boolToInt(p.FromMe),
+		nullIfEmpty(p.SenderJID), nullIfEmpty(p.SenderName), nullIfEmpty(p.Text),
+		nullIfEmpty(p.MediaType), nullIfEmpty(p.MediaCaption), nullIfEmpty(p.Filename),
+		nullIfEmpty(p.MimeType), nullIfEmpty(p.DirectPath),
+		p.MediaKey, p.FileSHA256, p.FileEncSHA256, int64(p.FileLength),
+		nullIfEmpty(p.BackgroundColor), int64(p.Font))
 	return err
 }
 

@@ -132,6 +132,11 @@ type App struct {
 	manualFetchMu           sync.Mutex
 	manualFetches           map[string]int
 	heartbeatLast           atomic.Int64
+	// ledgerBatches caches the current ledger batch ID per ingestion source.
+	ledgerBatches sync.Map
+	// sideEffects records post-projection side effects attributed to ledger
+	// events (in-memory; diagnostics and tests).
+	sideEffects sideEffectLog
 }
 
 func New(opts Options) (*App, error) {

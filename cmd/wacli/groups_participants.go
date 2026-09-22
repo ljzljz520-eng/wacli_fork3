@@ -120,7 +120,7 @@ func newGroupsParticipantsActionCmd(flags *rootFlags, action string) *cobra.Comm
 				return err
 			}
 			if info, err := a.WA().GetGroupInfo(ctx, gjid); err == nil && info != nil {
-				_ = persistGroupInfo(ctx, a.DB(), a.WA(), info)
+				_ = persistGroupInfo(ctx, a, info)
 			}
 
 			if flags.asJSON {

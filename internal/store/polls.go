@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -41,11 +42,57 @@ type PollListFilter struct {
 	Offset   int
 }
 
+// PollsTable is the polls table name.
+const PollsTable = "polls"
+
+// PollVotesTable is the poll votes table name.
+const PollVotesTable = "poll_votes"
+
+const pollOptionsReadSQL = `SELECT options_json FROM polls WHERE chat_jid = ? AND msg_id = ?`
+
+const pollUpsertSQL = `
+INSERT INTO polls (chat_jid, msg_id, sender_jid, question, options_json, selectable_count, created_ts)
+SELECT ?, ?, ?, ?, ?, ?, ?
+WHERE NOT EXISTS (
+    SELECT 1 FROM message_payload_purges p WHERE p.chat_jid = ? AND p.msg_id = ?
+)
+ON CONFLICT(chat_jid, msg_id) DO UPDATE SET
+    sender_jid = excluded.sender_jid,
+    question = excluded.question,
+    options_json = excluded.options_json,
+    selectable_count = excluded.selectable_count,
+    created_ts = excluded.created_ts
+`
+
+const pollVoteUpsertSQL = `
+INSERT INTO poll_votes (chat_jid, poll_msg_id, voter_jid, vote_msg_id, selected_options_json, ts)
+SELECT ?, ?, ?, ?, ?, ?
+WHERE NOT EXISTS (
+    SELECT 1 FROM message_payload_purges p WHERE p.chat_jid = ? AND p.msg_id = ?
+)
+  AND NOT EXISTS (
+    SELECT 1 FROM message_payload_purges p WHERE p.chat_jid = ? AND p.msg_id = ?
+)
+ON CONFLICT(chat_jid, poll_msg_id, voter_jid) DO UPDATE SET
+    vote_msg_id = excluded.vote_msg_id,
+    selected_options_json = excluded.selected_options_json,
+    ts = excluded.ts
+WHERE excluded.ts >= poll_votes.ts
+`
+
+const pollVoteDeleteSQL = `
+DELETE FROM poll_votes
+WHERE chat_jid = ? AND poll_msg_id = ? AND voter_jid = ? AND ts <= ?
+`
+
 // UpsertPoll inserts or replaces a poll row keyed on (chat_jid, msg_id).
 func (d *DB) UpsertPoll(p Poll) error {
-	if d == nil {
-		return fmt.Errorf("nil db")
-	}
+	return d.UpsertPollTarget(storeCtx(), d.sql, PollsTable, MessagePayloadPurges, p)
+}
+
+// UpsertPollTarget applies the poll-creation fold to the target table
+// (active or shadow) through ex, reading/guarding against purgesTable.
+func (d *DB) UpsertPollTarget(ctx context.Context, ex QueryExecer, table, purgesTable string, p Poll) error {
 	if strings.TrimSpace(p.ChatJID) == "" || strings.TrimSpace(p.MsgID) == "" {
 		return fmt.Errorf("poll requires chat_jid and msg_id")
 	}
@@ -53,7 +100,7 @@ func (d *DB) UpsertPoll(p Poll) error {
 		p.Options = []string{}
 	}
 	options := p.Options
-	if existing, err := d.pollOptions(p.ChatJID, p.MsgID); err == nil {
+	if existing, err := d.pollOptionsTarget(ctx, ex, table, p.ChatJID, p.MsgID); err == nil {
 		options = mergePollOptions(options, existing)
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return err
@@ -66,20 +113,27 @@ func (d *DB) UpsertPoll(p Poll) error {
 	if createdTS.IsZero() {
 		createdTS = nowUTC()
 	}
-	if err := d.q.UpsertPoll(storeCtx(), storedb.UpsertPollParams{
-		ChatJid:         p.ChatJID,
-		MsgID:           p.MsgID,
-		SenderJid:       nullString(p.SenderJID),
-		Question:        p.Question,
-		OptionsJson:     string(optsJSON),
-		SelectableCount: int64(p.SelectableCount),
-		CreatedTs:       createdTS.UTC().Unix(),
-		ChatJid_2:       p.ChatJID,
-		MsgID_2:         p.MsgID,
-	}); err != nil {
+	query := retargetPollQuery(pollUpsertSQL, PollsTable, table, purgesTable)
+	_, err = ex.ExecContext(ctx, query,
+		p.ChatJID, p.MsgID, nullString(p.SenderJID), p.Question, string(optsJSON),
+		int64(p.SelectableCount), createdTS.UTC().Unix(),
+		p.ChatJID, p.MsgID)
+	if err != nil {
 		return fmt.Errorf("upsert poll: %w", err)
 	}
 	return nil
+}
+
+// retargetPollQuery rewrites both the poll-family table and the purge guard
+// table in one generated query.
+func retargetPollQuery(query, oldTable, table, purgesTable string) string {
+	if oldTable != table {
+		query = RetargetTable(query, oldTable, table)
+	}
+	if purgesTable != MessagePayloadPurges {
+		query = RetargetTable(query, MessagePayloadPurges, purgesTable)
+	}
+	return query
 }
 
 // GetPoll fetches a single poll by (chat_jid, msg_id). Returns sql.ErrNoRows
@@ -217,9 +271,12 @@ func cleanPollFilterChatJIDs(filter PollListFilter) []string {
 
 // UpsertPollVote replaces the vote row for (chat, poll, voter).
 func (d *DB) UpsertPollVote(v PollVote) error {
-	if d == nil {
-		return fmt.Errorf("nil db")
-	}
+	return d.UpsertPollVoteTarget(storeCtx(), d.sql, PollVotesTable, MessagePayloadPurges, v)
+}
+
+// UpsertPollVoteTarget applies the vote fold to the target votes table
+// through ex, guarding against purgesTable.
+func (d *DB) UpsertPollVoteTarget(ctx context.Context, ex QueryExecer, table, purgesTable string, v PollVote) error {
 	if strings.TrimSpace(v.ChatJID) == "" || strings.TrimSpace(v.PollMsgID) == "" || strings.TrimSpace(v.VoterJID) == "" {
 		return fmt.Errorf("vote requires chat_jid, poll_msg_id, voter_jid")
 	}
@@ -234,18 +291,13 @@ func (d *DB) UpsertPollVote(v PollVote) error {
 	if ts.IsZero() {
 		ts = nowUTC()
 	}
-	if err := d.q.UpsertPollVote(storeCtx(), storedb.UpsertPollVoteParams{
-		ChatJid:             v.ChatJID,
-		PollMsgID:           v.PollMsgID,
-		VoterJid:            v.VoterJID,
-		VoteMsgID:           v.VoteMsgID,
-		SelectedOptionsJson: string(selJSON),
-		Ts:                  ts.UTC().UnixMilli(),
-		ChatJid_2:           v.ChatJID,
-		MsgID:               v.PollMsgID,
-		ChatJid_3:           v.ChatJID,
-		MsgID_2:             v.VoteMsgID,
-	}); err != nil {
+	query := retargetPollQuery(pollVoteUpsertSQL, PollVotesTable, table, purgesTable)
+	if _, err := ex.ExecContext(ctx, query,
+		v.ChatJID, v.PollMsgID, v.VoterJID, v.VoteMsgID, string(selJSON),
+		ts.UTC().UnixMilli(),
+		v.ChatJID, v.PollMsgID,
+		v.ChatJID, v.VoteMsgID,
+	); err != nil {
 		return fmt.Errorf("upsert poll vote: %w", err)
 	}
 	return nil
@@ -254,9 +306,14 @@ func (d *DB) UpsertPollVote(v PollVote) error {
 // DeletePollVote removes one voter's current vote if the deletion is not older
 // than the stored vote row.
 func (d *DB) DeletePollVote(chatJID, pollMsgID, voterJID string, votedAt time.Time) error {
-	if d == nil {
-		return fmt.Errorf("nil db")
-	}
+	return d.DeletePollVoteTarget(storeCtx(), d.sql, PollVotesTable,
+		chatJID, pollMsgID, voterJID, votedAt)
+}
+
+// DeletePollVoteTarget applies the vote retraction to the target table.
+func (d *DB) DeletePollVoteTarget(ctx context.Context, ex QueryExecer, table,
+	chatJID, pollMsgID, voterJID string, votedAt time.Time,
+) error {
 	if strings.TrimSpace(chatJID) == "" || strings.TrimSpace(pollMsgID) == "" || strings.TrimSpace(voterJID) == "" {
 		return fmt.Errorf("vote requires chat_jid, poll_msg_id, voter_jid")
 	}
@@ -264,12 +321,9 @@ func (d *DB) DeletePollVote(chatJID, pollMsgID, voterJID string, votedAt time.Ti
 	if ts.IsZero() {
 		ts = nowUTC()
 	}
-	if err := d.q.DeletePollVote(storeCtx(), storedb.DeletePollVoteParams{
-		ChatJid:   chatJID,
-		PollMsgID: pollMsgID,
-		VoterJid:  voterJID,
-		Ts:        ts.UTC().UnixMilli(),
-	}); err != nil {
+	query := RetargetTable(pollVoteDeleteSQL, PollVotesTable, table)
+	if _, err := ex.ExecContext(ctx, query,
+		chatJID, pollMsgID, voterJID, ts.UTC().UnixMilli()); err != nil {
 		return fmt.Errorf("delete poll vote: %w", err)
 	}
 	return nil
@@ -287,9 +341,28 @@ func (d *DB) ListPollVotes(chatJID, pollMsgID string) ([]PollVote, error) {
 	return pollVotesFromRows(rows)
 }
 
-func (d *DB) pollOptions(chatJID, msgID string) ([]string, error) {
-	raw, err := d.q.PollOptions(storeCtx(), storedb.PollOptionsParams{ChatJid: chatJID, MsgID: msgID})
+func (d *DB) pollOptionsTarget(ctx context.Context, ex QueryExecer, table,
+	chatJID, msgID string,
+) ([]string, error) {
+	return readPollOptions(ctx, ex, table, chatJID, msgID)
+}
+
+// readPollOptions reads the stored options JSON for one poll from an arbitrary
+// target table. It returns sql.ErrNoRows when the poll row is absent.
+func readPollOptions(ctx context.Context, ex QueryExecer, table,
+	chatJID, msgID string,
+) ([]string, error) {
+	query := RetargetTable(pollOptionsReadSQL, PollsTable, table)
+	rows, err := ex.QueryContext(ctx, query, chatJID, msgID)
 	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return nil, sql.ErrNoRows
+	}
+	var raw string
+	if err := rows.Scan(&raw); err != nil {
 		return nil, err
 	}
 	var options []string

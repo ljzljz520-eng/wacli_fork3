@@ -58,6 +58,10 @@ func snippetSQL(snippet string) string {
 }
 
 func (d *DB) UpsertMessage(p UpsertMessageParams) error {
+	return d.q.UpsertMessage(storeCtx(), buildStoredbUpsertParams(p))
+}
+
+func buildStoredbUpsertParams(p UpsertMessageParams) storedb.UpsertMessageParams {
 	var deletedAt sql.NullInt64
 	if p.Revoked || p.DeletedForMe || !p.DeletedAt.IsZero() {
 		if p.DeletedAt.IsZero() {
@@ -88,7 +92,7 @@ func (d *DB) UpsertMessage(p UpsertMessageParams) error {
 	if p.Edited {
 		editedTS = unix(p.Timestamp)
 	}
-	return d.q.UpsertMessage(storeCtx(), storedb.UpsertMessageParams{
+	return storedb.UpsertMessageParams{
 		ChatJid:         p.ChatJID,
 		ChatName:        nullString(p.ChatName),
 		MsgID:           p.MsgID,
@@ -122,7 +126,7 @@ func (d *DB) UpsertMessage(p UpsertMessageParams) error {
 		Buttons:         buttonsJSON,
 		ChatJid_2:       strings.TrimSpace(p.ChatJID),
 		MsgID_2:         strings.TrimSpace(p.MsgID),
-	})
+	}
 }
 
 func (d *DB) MarkMessageRevoked(chatJID, msgID string) error {

@@ -21,6 +21,12 @@ func (a *App) canonicalStoreJID(ctx context.Context, jid types.JID) types.JID {
 	return canonicalJID(a.wa.ResolveLIDToPN(ctx, jid))
 }
 
+// ResolveLIDToPN exposes the underlying client resolution for cmd-side
+// persistence helpers (persistGroupInfo).
+func (a *App) ResolveLIDToPN(ctx context.Context, jid types.JID) types.JID {
+	return a.wa.ResolveLIDToPN(ctx, jid)
+}
+
 func (a *App) canonicalStoreJIDString(ctx context.Context, raw string) string {
 	jid, err := types.ParseJID(raw)
 	if err != nil {

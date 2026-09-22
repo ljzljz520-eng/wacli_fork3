@@ -115,7 +115,7 @@ func newSendStatusCmd(flags *rootFlags) *cobra.Command {
 			if fontPtr != nil {
 				storedFont = *fontPtr
 			}
-			storeErr := a.DB().UpsertStatusMessage(store.UpsertStatusMessageParams{
+			storeErr := a.UpsertStatusMessageWithLedger(ctx, store.UpsertStatusMessageParams{
 				MsgID:           string(msgID),
 				Timestamp:       now,
 				FromMe:          true,

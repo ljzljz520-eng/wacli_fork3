@@ -106,6 +106,36 @@ func (e syncWebhookEvent) logFields() map[string]any {
 	return fields
 }
 
+// sideEffectTargets returns the (chat, message) pairs this webhook delivery
+// acts on, used to attribute it to ledger events. Receipts carry several
+// message IDs; chat presence carries none.
+func (e syncWebhookEvent) sideEffectTargets() []AttributedSideEffect {
+	switch e.Kind {
+	case SyncWebhookEventReceipt:
+		out := make([]AttributedSideEffect, 0, len(e.Receipt.MessageIDs))
+		chat := e.Receipt.Chat.String()
+		for _, msgID := range e.Receipt.MessageIDs {
+			out = append(out, AttributedSideEffect{
+				Kind:    SideEffectWebhook,
+				ChatJID: chat,
+				MsgID:   msgID,
+			})
+		}
+		return out
+	case SyncWebhookEventChatPresence:
+		return []AttributedSideEffect{{
+			Kind:    SideEffectWebhook,
+			ChatJID: e.Presence.Chat.String(),
+		}}
+	default:
+		return []AttributedSideEffect{{
+			Kind:    SideEffectWebhook,
+			ChatJID: e.Message.Chat.String(),
+			MsgID:   e.Message.ID,
+		}}
+	}
+}
+
 type syncWebhookReceipt struct {
 	Chat       types.JID `json:"Chat"`
 	Sender     types.JID `json:"Sender"`

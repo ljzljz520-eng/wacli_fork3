@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/openclaw/wacli/internal/ledger"
 	"github.com/openclaw/wacli/internal/store"
 	"github.com/openclaw/wacli/internal/wa"
 	"go.mau.fi/whatsmeow/appstate"
@@ -281,6 +282,32 @@ func TestHistorySyncStoresConversationUnreadCount(t *testing.T) {
 	}
 	if !c.Unread || c.UnreadCount != 3 {
 		t.Fatalf("unread state after history sync = %+v, want count 3", c)
+	}
+
+	// The unread snapshot must have been appended before the direct write.
+	head, err := a.db.HeadSeq()
+	if err != nil {
+		t.Fatalf("HeadSeq: %v", err)
+	}
+	found := false
+	err = a.db.ScanEvents(0, head, func(e *store.StoredEvent) error {
+		if e.Source == ledger.SourceHistory && e.EventType == ledger.EventMarkRead &&
+			e.ChatJID == chat.String() {
+			_, raw, derr := a.db.GetRaw(e.EventID)
+			if derr == nil {
+				state, derr2 := wa.DecodeStateEvent(raw)
+				if derr2 == nil && state.Type == ledger.StateUnreadCount && state.Count == 3 {
+					found = true
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ScanEvents: %v", err)
+	}
+	if !found {
+		t.Fatal("ledger has no history unread_count(count=3) event")
 	}
 }
 

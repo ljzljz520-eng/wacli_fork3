@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -72,6 +73,33 @@ func open(path string, readOnly bool) (*DB, error) {
 func (d *DB) validateReadable() error {
 	var n int
 	return d.sql.QueryRow("SELECT count(*) FROM sqlite_master").Scan(&n)
+}
+
+// BeginTx starts a transaction on the application database. Used by the
+// checkpoint projector runner so view writes and checkpoint advances commit
+// atomically.
+func (d *DB) BeginTx(ctx context.Context) (*sql.Tx, error) {
+	return d.sql.BeginTx(ctx, nil)
+}
+
+// Query runs a read query on the application database.
+func (d *DB) Query(query string, args ...any) (*sql.Rows, error) {
+	return d.sql.Query(query, args...)
+}
+
+// QueryRow runs a single-row query on the application database.
+func (d *DB) QueryRow(query string, args ...any) *sql.Row {
+	return d.sql.QueryRow(query, args...)
+}
+
+// Exec runs a statement on the application database.
+func (d *DB) Exec(query string, args ...any) (sql.Result, error) {
+	return d.sql.Exec(query, args...)
+}
+
+// FTSEnabled reports whether the FTS5 virtual table is available.
+func (d *DB) FTSEnabled() bool {
+	return d.ftsEnabled
 }
 
 func sqliteURI(path string, readOnly bool) string {

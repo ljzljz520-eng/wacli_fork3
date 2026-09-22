@@ -18,11 +18,23 @@ type groupJIDResolver interface {
 	ResolveLIDToPN(context.Context, types.JID) types.JID
 }
 
-func persistGroupInfo(ctx context.Context, db *store.DB, resolver groupJIDResolver, info *types.GroupInfo) error {
+// groupPersistTarget is the subset of *app.App needed to persist a group
+// snapshot: ingest the canonical event, then perform direct writes.
+type groupPersistTarget interface {
+	groupJIDResolver
+	DB() *store.DB
+	StoreGroupSnapshot(context.Context, *types.GroupInfo) error
+}
+
+func persistGroupInfo(ctx context.Context, target groupPersistTarget, info *types.GroupInfo) error {
 	if info == nil {
 		return nil
 	}
-	ownerJID := canonicalCLIJID(resolver.ResolveLIDToPN(ctx, info.OwnerJID)).String()
+	if err := target.StoreGroupSnapshot(ctx, info); err != nil {
+		return err
+	}
+	db := target.DB()
+	ownerJID := canonicalCLIJID(target.ResolveLIDToPN(ctx, info.OwnerJID)).String()
 	if err := db.UpsertGroupWithHierarchy(
 		info.JID.String(),
 		info.GroupName.Name,
@@ -43,7 +55,7 @@ func persistGroupInfo(ctx context.Context, db *store.DB, resolver groupJIDResolv
 		}
 		ps = append(ps, store.GroupParticipant{
 			GroupJID: info.JID.String(),
-			UserJID:  canonicalCLIJID(resolver.ResolveLIDToPN(ctx, p.JID)).String(),
+			UserJID:  canonicalCLIJID(target.ResolveLIDToPN(ctx, p.JID)).String(),
 			Role:     role,
 		})
 	}

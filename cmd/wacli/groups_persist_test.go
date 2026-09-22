@@ -20,6 +20,17 @@ func (r groupPersistResolver) ResolveLIDToPN(_ context.Context, jid types.JID) t
 	return jid
 }
 
+type groupPersistTargetStub struct {
+	db *store.DB
+	groupPersistResolver
+}
+
+func (s groupPersistTargetStub) DB() *store.DB { return s.db }
+
+func (s groupPersistTargetStub) StoreGroupSnapshot(context.Context, *types.GroupInfo) error {
+	return nil
+}
+
 func TestPersistGroupInfoResolvesKnownLIDs(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "wacli.db")
 	db, err := store.Open(path)
@@ -43,7 +54,8 @@ func TestPersistGroupInfoResolvesKnownLIDs(t *testing.T) {
 		GroupCreated: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
 	}
 	resolver := groupPersistResolver{knownLID: knownPN}
-	if err := persistGroupInfo(context.Background(), db, resolver, info); err != nil {
+	target := groupPersistTargetStub{db: db, groupPersistResolver: resolver}
+	if err := persistGroupInfo(context.Background(), target, info); err != nil {
 		t.Fatalf("persistGroupInfo: %v", err)
 	}
 

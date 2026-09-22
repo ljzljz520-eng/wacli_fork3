@@ -19,15 +19,15 @@ import (
 
 // handlePollSideEffects writes Poll / PollVote rows after the underlying
 // message has been persisted to the messages table.
-func (a *App) handlePollSideEffects(ctx context.Context, pm wa.ParsedMessage, evt *events.Message) {
+func (a *App) handlePollSideEffects(ctx context.Context, source string, pm wa.ParsedMessage, evt *events.Message) {
 	if pm.Poll != nil {
-		a.upsertPollFromParsed(ctx, pm)
+		a.upsertPollFromParsed(ctx, source, pm)
 	}
 	if pm.PollAdd != nil && evt != nil {
-		a.handlePollAddOption(ctx, pm, evt)
+		a.handlePollAddOption(ctx, source, pm, evt)
 	}
 	if pm.PollVote != nil && evt != nil {
-		a.handlePollVote(ctx, pm, evt)
+		a.handlePollVote(ctx, source, pm, evt)
 	}
 }
 
@@ -35,7 +35,7 @@ func (a *App) handlePollSideEffects(ctx context.Context, pm wa.ParsedMessage, ev
 // arriving via HistorySync, where we have a *waProto.WebMessageInfo rather
 // than an events.Message. Vote decryption requires an events.Message-shaped
 // input, which we reconstruct via ParseWebMessage.
-func (a *App) handleHistoryPollSideEffects(ctx context.Context, pm wa.ParsedMessage, evt *events.Message, hist *waProto.WebMessageInfo) {
+func (a *App) handleHistoryPollSideEffects(ctx context.Context, source string, pm wa.ParsedMessage, evt *events.Message, hist *waProto.WebMessageInfo) {
 	if evt == nil {
 		if normalized, parsed, ok := a.normalizeHistoryPollMessage(pm, hist); ok {
 			pm = normalized
@@ -43,7 +43,7 @@ func (a *App) handleHistoryPollSideEffects(ctx context.Context, pm wa.ParsedMess
 		}
 	}
 	if pm.Poll != nil {
-		a.upsertPollFromParsed(ctx, pm)
+		a.upsertPollFromParsed(ctx, source, pm)
 	}
 	if pm.PollAdd != nil {
 		if evt == nil && hist != nil {
@@ -59,7 +59,7 @@ func (a *App) handleHistoryPollSideEffects(ctx context.Context, pm wa.ParsedMess
 			evt = parsed
 		}
 		if evt != nil {
-			a.handlePollAddOption(ctx, pm, evt)
+			a.handlePollAddOption(ctx, source, pm, evt)
 		}
 	}
 	if pm.PollVote != nil {
@@ -83,7 +83,7 @@ func (a *App) handleHistoryPollSideEffects(ctx context.Context, pm wa.ParsedMess
 			)
 			return
 		}
-		a.handlePollVote(ctx, pm, evt)
+		a.handlePollVote(ctx, source, pm, evt)
 	}
 }
 
@@ -93,20 +93,20 @@ type historyPollSideEffect struct {
 	hist *waProto.WebMessageInfo
 }
 
-func (a *App) handleHistoryPollSideEffectsBatch(ctx context.Context, pending []historyPollSideEffect) {
+func (a *App) handleHistoryPollSideEffectsBatch(ctx context.Context, source string, pending []historyPollSideEffect) {
 	for _, item := range pending {
 		if item.pm.Poll != nil {
-			a.handleHistoryPollSideEffects(ctx, item.pm, item.evt, item.hist)
+			a.handleHistoryPollSideEffects(ctx, source, item.pm, item.evt, item.hist)
 		}
 	}
 	for _, item := range pending {
 		if item.pm.Poll == nil && item.pm.PollAdd != nil {
-			a.handleHistoryPollSideEffects(ctx, item.pm, item.evt, item.hist)
+			a.handleHistoryPollSideEffects(ctx, source, item.pm, item.evt, item.hist)
 		}
 	}
 	for _, item := range pending {
 		if item.pm.Poll == nil && item.pm.PollAdd == nil && item.pm.PollVote != nil {
-			a.handleHistoryPollSideEffects(ctx, item.pm, item.evt, item.hist)
+			a.handleHistoryPollSideEffects(ctx, source, item.pm, item.evt, item.hist)
 		}
 	}
 }
@@ -153,7 +153,7 @@ func historyPollNeedsEventParse(pm wa.ParsedMessage, hist *waProto.WebMessageInf
 		msg.GetViewOnceMessageV2Extension().GetMessage() != nil
 }
 
-func (a *App) handlePollAddOption(ctx context.Context, pm wa.ParsedMessage, evt *events.Message) {
+func (a *App) handlePollAddOption(ctx context.Context, source string, pm wa.ParsedMessage, evt *events.Message) {
 	if a.db == nil || pm.PollAdd == nil {
 		return
 	}
@@ -203,6 +203,13 @@ func (a *App) handlePollAddOption(ctx context.Context, pm wa.ParsedMessage, evt 
 		return
 	}
 	poll.Options = append(poll.Options, option)
+	if err := a.AppendPollOptionWithLedger(ctx, source, chatJID, pollMsgID, option); err != nil {
+		a.emitWarning(
+			"poll_add_ledger_failed",
+			fmt.Sprintf("warning: failed to record poll option %s: %v", pm.ID, err),
+			map[string]any{"message_id": pm.ID, "error": err.Error()},
+		)
+	}
 	if err := a.db.UpsertPoll(poll); err != nil {
 		a.emitWarning(
 			"poll_add_store_failed",
@@ -212,7 +219,7 @@ func (a *App) handlePollAddOption(ctx context.Context, pm wa.ParsedMessage, evt 
 	}
 }
 
-func (a *App) upsertPollFromParsed(ctx context.Context, pm wa.ParsedMessage) {
+func (a *App) upsertPollFromParsed(ctx context.Context, source string, pm wa.ParsedMessage) {
 	if a.db == nil || pm.Poll == nil {
 		return
 	}
@@ -230,7 +237,7 @@ func (a *App) upsertPollFromParsed(ctx context.Context, pm wa.ParsedMessage) {
 			}
 		}
 	}
-	if err := a.db.UpsertPoll(store.Poll{
+	if err := a.UpsertPollWithLedger(ctx, source, store.Poll{
 		ChatJID:         chatJID,
 		MsgID:           pm.ID,
 		SenderJID:       senderJID,
@@ -247,7 +254,7 @@ func (a *App) upsertPollFromParsed(ctx context.Context, pm wa.ParsedMessage) {
 	}
 }
 
-func (a *App) handlePollVote(ctx context.Context, pm wa.ParsedMessage, evt *events.Message) {
+func (a *App) handlePollVote(ctx context.Context, source string, pm wa.ParsedMessage, evt *events.Message) {
 	if a.db == nil || pm.PollVote == nil || evt == nil {
 		return
 	}
@@ -316,7 +323,7 @@ func (a *App) handlePollVote(ctx context.Context, pm wa.ParsedMessage, evt *even
 
 	votedAt := pollVoteTimestamp(pm)
 	if len(selectedHashes) == 0 {
-		if err := a.db.DeletePollVote(chatJID, pollMsgID, voterJID, votedAt); err != nil {
+		if err := a.DeletePollVoteWithLedger(ctx, source, chatJID, pollMsgID, voterJID, votedAt); err != nil {
 			a.emitWarning(
 				"poll_vote_delete_failed",
 				fmt.Sprintf("warning: failed to delete poll vote %s: %v", pm.ID, err),
@@ -326,7 +333,7 @@ func (a *App) handlePollVote(ctx context.Context, pm wa.ParsedMessage, evt *even
 		return
 	}
 
-	if err := a.db.UpsertPollVote(store.PollVote{
+	if err := a.UpsertPollVoteWithLedger(ctx, source, store.PollVote{
 		ChatJID:       chatJID,
 		PollMsgID:     pollMsgID,
 		VoterJID:      voterJID,

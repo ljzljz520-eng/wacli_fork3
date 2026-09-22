@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/openclaw/wacli/internal/ledger"
 	"github.com/openclaw/wacli/internal/store"
 	"github.com/openclaw/wacli/internal/wa"
 	"go.mau.fi/whatsmeow/appstate"
@@ -115,7 +116,15 @@ func (a *App) addSyncEventHandler(ctx context.Context, opts SyncOptions, message
 			a.handleHistorySync(ctx, opts, v, messagesStored, lastEvent, enqueueMedia, limits)
 		case *events.Receipt:
 			lastEvent.Store(nowUTC().UnixNano())
-			a.handleReceiptPersistenceEvent(ctx, v)
+			if err := a.ingestReceiptEvent(ctx, v); err != nil {
+				a.emitWarning(
+					"ledger_receipt_failed",
+					fmt.Sprintf("warning: failed to append ledger event for receipt: %v", err),
+					map[string]any{"error": err.Error()},
+				)
+			} else {
+				a.handleReceiptPersistenceEvent(ctx, v)
+			}
 			if opts.WebhookEvents.Enabled(SyncWebhookEventReceipt) {
 				if job, ok := newSyncWebhookReceiptEvent(v); ok {
 					enqueueWebhook(job)
@@ -321,6 +330,14 @@ func (a *App) clearLiveAppStateRecovery(markers []appStateRecoveryMarker) {
 }
 
 func (a *App) persistAppStateEvent(ctx context.Context, evt any, tracker *appStatePersistenceTracker) error {
+	// Append to the ledger before materializing the event. Replays and the
+	// immediate persist collapse via the deterministic dedup key.
+	if err := a.ingestAppStateEvent(ctx, evt); err != nil {
+		if tracker != nil {
+			tracker.record(err)
+		}
+		return err
+	}
 	var err error
 	switch v := evt.(type) {
 	case *events.AppState:
@@ -421,7 +438,7 @@ func (a *App) handleLiveCallEvent(ctx context.Context, evt any) error {
 	// returns one call record, while that record may contain many participants.
 	call, ok := wa.ParseLiveCallEvent(evt, self, alternateSelf...)
 	if ok {
-		if err := a.storeParsedCallEvent(ctx, call, "", ""); err != nil {
+		if err := a.storeParsedCallEvent(ctx, call, "", "", ledger.SourceAppState); err != nil {
 			a.emitWarning(
 				"call_event_store_failed",
 				fmt.Sprintf("warning: failed to store call event %s: %v", call.EventType, err),
@@ -436,7 +453,7 @@ func (a *App) handleLiveCallEvent(ctx context.Context, evt any) error {
 	if !ok {
 		return nil
 	}
-	if err := a.deleteParsedCallEvents(ctx, deleted); err != nil {
+	if err := a.deleteParsedCallEvents(ctx, ledger.SourceAppState, deleted); err != nil {
 		a.emitWarning(
 			"call_event_delete_failed",
 			fmt.Sprintf("warning: failed to delete call log events: %v", err),
@@ -479,7 +496,7 @@ func (a *App) handleStarEvent(ctx context.Context, evt *events.Star) error {
 	if !evt.SenderJID.IsEmpty() {
 		senderJID = canonicalJIDString(a.canonicalStoreJID(ctx, evt.SenderJID))
 	}
-	if err := a.db.SetStarred(store.SetStarredParams{
+	if err := a.SetStarredWithLedger(ctx, ledger.SourceAppState, store.SetStarredParams{
 		ChatJID:   canonicalJIDString(a.canonicalStoreJID(ctx, evt.ChatJID)),
 		MsgID:     evt.MessageID,
 		SenderJID: senderJID,
@@ -523,7 +540,7 @@ func (a *App) handleLiveSyncMessage(ctx context.Context, opts SyncOptions, v *ev
 		if ctx.Err() != nil {
 			sideEffectCtx = context.WithoutCancel(ctx)
 		}
-		a.handlePollSideEffects(sideEffectCtx, pm, v)
+		a.handlePollSideEffects(sideEffectCtx, ledger.SourceLive, pm, v)
 	}
 	if opts.DownloadMedia && pm.Media != nil && pm.ID != "" {
 		enqueueMedia(canonicalJIDString(a.canonicalStoreJID(ctx, pm.Chat)), pm.ID)
@@ -661,6 +678,15 @@ func (a *App) handleHistorySync(ctx context.Context, opts SyncOptions, v *events
 			}
 			storedPM := pm
 			storedPM.UnhandledPayload = ""
+			switch v.Data.GetSyncType() {
+			case waHistorySync.HistorySync_ON_DEMAND:
+				storedPM.IngestSource = ledger.SourceOnDemandHistory
+			case waHistorySync.HistorySync_INITIAL_BOOTSTRAP:
+				storedPM.IngestSource = ledger.SourceHistory
+				storedPM.FromFullSync = true
+			default:
+				storedPM.IngestSource = ledger.SourceHistory
+			}
 			if err := a.storeParsedMessageForSync(ctx, storedPM, limits...); err == nil {
 				unhandledWarnings.observe(a, pm)
 				a.emitSyncProgress(messagesStored.Add(1))
@@ -668,7 +694,7 @@ func (a *App) handleHistorySync(ctx context.Context, opts SyncOptions, v *events
 					pendingPolls = append(pendingPolls, historyPollSideEffect{pm: pm, evt: pollEvt, hist: m.Message})
 				}
 			} else if ctx.Err() != nil {
-				a.handleHistoryPollSideEffectsBatch(context.WithoutCancel(ctx), pendingPolls)
+				a.handleHistoryPollSideEffectsBatch(context.WithoutCancel(ctx), ledger.SourceHistory, pendingPolls)
 				return
 			}
 			if opts.DownloadMedia && pm.Media != nil && pm.ID != "" {
@@ -679,7 +705,7 @@ func (a *App) handleHistorySync(ctx context.Context, opts SyncOptions, v *events
 		if ctx.Err() != nil {
 			flushCtx = context.WithoutCancel(ctx)
 		}
-		a.handleHistoryPollSideEffectsBatch(flushCtx, pendingPolls)
+		a.handleHistoryPollSideEffectsBatch(flushCtx, ledger.SourceHistory, pendingPolls)
 	}
 	if !a.eventsEnabled() {
 		a.emitOrPrint("progress", map[string]any{"messages_synced": messagesStored.Load()}, "\rSynced %d messages...", messagesStored.Load())
@@ -703,7 +729,7 @@ func (a *App) storeHistoryCallLogRecords(ctx context.Context, v *events.HistoryS
 		if !ok {
 			continue
 		}
-		if err := a.storeParsedCallEvent(ctx, call, "", ""); err != nil {
+		if err := a.storeParsedCallEvent(ctx, call, "", "", ledger.SourceHistory); err != nil {
 			a.emitWarning(
 				"history_call_log_store_failed",
 				fmt.Sprintf("warning: failed to store history call log %s: %v", call.CallID, err),
@@ -746,6 +772,15 @@ func (a *App) storeHistoryUnreadCount(ctx context.Context, chatID string, conv *
 	}
 	count := int(conv.GetUnreadCount())
 	chat = a.canonicalStoreJID(ctx, chat)
+	// Append the explicit unread snapshot before the direct (phase A) write.
+	if err := a.ingestUnreadStateEvent(ctx, canonicalJIDString(chat), count, conv.GetMarkedAsUnread()); err != nil {
+		a.emitWarning(
+			"history_unread_ledger_failed",
+			fmt.Sprintf("warning: failed to append unread state for chat %s: %v", chat, err),
+			map[string]any{"chat_jid": chat.String(), "error": err.Error()},
+		)
+		return
+	}
 	var storeErr error
 	if count > 0 {
 		storeErr = a.db.SetChatUnreadCount(canonicalJIDString(chat), count)

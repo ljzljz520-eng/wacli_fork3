@@ -1,11 +1,67 @@
 package store
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 )
+
+// CallEventsTable is the call events table name.
+const CallEventsTable = "call_events"
+
+const callEventInsertSQL = `
+		INSERT INTO call_events(
+			chat_jid, chat_name, sender_jid, sender_name, call_id, msg_id, event_type,
+			direction, media, outcome, reason, call_type, duration_secs, ts, participants
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(chat_jid, call_id, event_type, ts) DO UPDATE SET
+			chat_name=COALESCE(NULLIF(excluded.chat_name,''), call_events.chat_name),
+			sender_jid=COALESCE(NULLIF(excluded.sender_jid,''), call_events.sender_jid),
+			sender_name=COALESCE(NULLIF(excluded.sender_name,''), call_events.sender_name),
+			msg_id=COALESCE(NULLIF(excluded.msg_id,''), call_events.msg_id),
+			direction=COALESCE(NULLIF(excluded.direction,''), call_events.direction),
+			media=COALESCE(NULLIF(excluded.media,''), call_events.media),
+			outcome=COALESCE(NULLIF(excluded.outcome,''), call_events.outcome),
+			reason=COALESCE(NULLIF(excluded.reason,''), call_events.reason),
+			call_type=COALESCE(NULLIF(excluded.call_type,''), call_events.call_type),
+			duration_secs=CASE WHEN excluded.duration_secs > 0 THEN excluded.duration_secs ELSE call_events.duration_secs END,
+			participants=COALESCE(NULLIF(excluded.participants,''), call_events.participants)`
+
+const callEventLookupSQL = `
+		SELECT rowid
+		FROM call_events
+		WHERE chat_jid=? AND call_id=? AND event_type=?
+		ORDER BY ts DESC, rowid DESC
+		LIMIT 2`
+
+const callEventUpdateSQL = `
+			UPDATE call_events SET
+				chat_jid=?,
+				chat_name=COALESCE(NULLIF(?,''), chat_name),
+				sender_jid=COALESCE(NULLIF(?,''), sender_jid),
+				sender_name=COALESCE(NULLIF(?,''), sender_name),
+				msg_id=COALESCE(NULLIF(?,''), msg_id),
+				direction=COALESCE(NULLIF(?,''), direction),
+				media=COALESCE(NULLIF(?,''), media),
+				outcome=COALESCE(NULLIF(?,''), outcome),
+				reason=COALESCE(NULLIF(?,''), reason),
+				call_type=COALESCE(NULLIF(?,''), call_type),
+				duration_secs=CASE WHEN ? > 0 THEN ? ELSE duration_secs END,
+				ts=?,
+				participants=COALESCE(NULLIF(?,''), participants)
+			WHERE rowid=? AND chat_jid=? AND call_id=? AND event_type=?`
+
+const callEventDeleteBaseSQL = `DELETE FROM call_events WHERE chat_jid = ? AND event_type = 'call_log'`
+
+// QueryExecer abstracts *sql.DB and *sql.Tx for target-table writes.
+type QueryExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
 
 type UpsertCallEventParams struct {
 	ChatJID      string
@@ -26,6 +82,12 @@ type UpsertCallEventParams struct {
 }
 
 func (d *DB) UpsertCallEvent(p UpsertCallEventParams) error {
+	return d.UpsertCallEventTarget(storeCtx(), d.sql, CallEventsTable, p)
+}
+
+// UpsertCallEventTarget applies the call-event fold to the target table
+// (active or shadow) through ex.
+func (d *DB) UpsertCallEventTarget(ctx context.Context, ex QueryExecer, table string, p UpsertCallEventParams) error {
 	chatJID := strings.TrimSpace(p.ChatJID)
 	eventType := strings.TrimSpace(p.EventType)
 	if chatJID == "" {
@@ -55,46 +117,27 @@ func (d *DB) UpsertCallEvent(p UpsertCallEventParams) error {
 	}
 
 	if !generatedCallID {
-		rowID, ok, err := d.singleCallEventRow(chatJID, callID, eventType)
+		lookupQ := RetargetTable(callEventLookupSQL, CallEventsTable, table)
+		rowID, ok, err := lookupSingleCallEventRow(ctx, ex, lookupQ, chatJID, callID, eventType)
 		if err != nil {
 			return err
 		}
 		if ok {
-			return d.updateCallEventRow(rowID, p, chatJID, callID, eventType, ts, participantsJSON)
+			updateQ := RetargetTable(callEventUpdateSQL, CallEventsTable, table)
+			return updateCallEventRowTarget(ctx, ex, updateQ, p, chatJID, callID, eventType, ts, participantsJSON, rowID)
 		}
 	}
 
-	_, err := d.sql.Exec(`
-		INSERT INTO call_events(
-			chat_jid, chat_name, sender_jid, sender_name, call_id, msg_id, event_type,
-			direction, media, outcome, reason, call_type, duration_secs, ts, participants
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(chat_jid, call_id, event_type, ts) DO UPDATE SET
-			chat_name=COALESCE(NULLIF(excluded.chat_name,''), call_events.chat_name),
-			sender_jid=COALESCE(NULLIF(excluded.sender_jid,''), call_events.sender_jid),
-			sender_name=COALESCE(NULLIF(excluded.sender_name,''), call_events.sender_name),
-			msg_id=COALESCE(NULLIF(excluded.msg_id,''), call_events.msg_id),
-			direction=COALESCE(NULLIF(excluded.direction,''), call_events.direction),
-			media=COALESCE(NULLIF(excluded.media,''), call_events.media),
-			outcome=COALESCE(NULLIF(excluded.outcome,''), call_events.outcome),
-			reason=COALESCE(NULLIF(excluded.reason,''), call_events.reason),
-			call_type=COALESCE(NULLIF(excluded.call_type,''), call_events.call_type),
-			duration_secs=CASE WHEN excluded.duration_secs > 0 THEN excluded.duration_secs ELSE call_events.duration_secs END,
-			participants=COALESCE(NULLIF(excluded.participants,''), call_events.participants)
-	`, chatJID, nullIfEmpty(p.ChatName), nullIfEmpty(p.SenderJID), nullIfEmpty(p.SenderName),
-		callID, nullIfEmpty(p.MsgID), eventType, nullIfEmpty(p.Direction), nullIfEmpty(p.Media),
-		nullIfEmpty(p.Outcome), nullIfEmpty(p.Reason), nullIfEmpty(p.CallType), p.DurationSecs, ts, participantsJSON)
+	insertQ := RetargetTable(callEventInsertSQL, CallEventsTable, table)
+	_, err := ex.ExecContext(ctx, insertQ, chatJID, nullIfEmpty(p.ChatName), nullIfEmpty(p.SenderJID),
+		nullIfEmpty(p.SenderName), callID, nullIfEmpty(p.MsgID), eventType,
+		nullIfEmpty(p.Direction), nullIfEmpty(p.Media), nullIfEmpty(p.Outcome),
+		nullIfEmpty(p.Reason), nullIfEmpty(p.CallType), p.DurationSecs, ts, participantsJSON)
 	return err
 }
 
-func (d *DB) singleCallEventRow(chatJID, callID, eventType string) (int64, bool, error) {
-	rows, err := d.sql.Query(`
-		SELECT rowid
-		FROM call_events
-		WHERE chat_jid=? AND call_id=? AND event_type=?
-		ORDER BY ts DESC, rowid DESC
-		LIMIT 2
-	`, chatJID, callID, eventType)
+func lookupSingleCallEventRow(ctx context.Context, ex QueryExecer, query, chatJID, callID, eventType string) (int64, bool, error) {
+	rows, err := ex.QueryContext(ctx, query, chatJID, callID, eventType)
 	if err != nil {
 		return 0, false, err
 	}
@@ -117,34 +160,15 @@ func (d *DB) singleCallEventRow(chatJID, callID, eventType string) (int64, bool,
 	return ids[0], true, nil
 }
 
-func (d *DB) updateCallEventRow(rowID int64, p UpsertCallEventParams, chatJID, callID, eventType string, ts int64, participantsJSON any) error {
-	res, err := d.sql.Exec(`
-			UPDATE call_events SET
-				chat_jid=?,
-				chat_name=COALESCE(NULLIF(?,''), chat_name),
-				sender_jid=COALESCE(NULLIF(?,''), sender_jid),
-				sender_name=COALESCE(NULLIF(?,''), sender_name),
-				msg_id=COALESCE(NULLIF(?,''), msg_id),
-				direction=COALESCE(NULLIF(?,''), direction),
-				media=COALESCE(NULLIF(?,''), media),
-				outcome=COALESCE(NULLIF(?,''), outcome),
-				reason=COALESCE(NULLIF(?,''), reason),
-				call_type=COALESCE(NULLIF(?,''), call_type),
-				duration_secs=CASE WHEN ? > 0 THEN ? ELSE duration_secs END,
-				ts=?,
-				participants=COALESCE(NULLIF(?,''), participants)
-			WHERE rowid=? AND chat_jid=? AND call_id=? AND event_type=?
-	`, chatJID, nullIfEmpty(p.ChatName), nullIfEmpty(p.SenderJID), nullIfEmpty(p.SenderName),
+func updateCallEventRowTarget(ctx context.Context, ex QueryExecer, query string, p UpsertCallEventParams,
+	chatJID, callID, eventType string, ts int64, participantsJSON any, rowID int64,
+) error {
+	_, err := ex.ExecContext(ctx, query,
+		chatJID, nullIfEmpty(p.ChatName), nullIfEmpty(p.SenderJID), nullIfEmpty(p.SenderName),
 		nullIfEmpty(p.MsgID), nullIfEmpty(p.Direction), nullIfEmpty(p.Media), nullIfEmpty(p.Outcome),
-		nullIfEmpty(p.Reason), nullIfEmpty(p.CallType), p.DurationSecs, p.DurationSecs, ts, participantsJSON,
-		rowID, chatJID, callID, eventType)
-	if err != nil {
-		return err
-	}
-	if rows, err := res.RowsAffected(); err == nil && rows > 0 {
-		return nil
-	}
-	return nil
+		nullIfEmpty(p.Reason), nullIfEmpty(p.CallType), p.DurationSecs, p.DurationSecs, ts,
+		participantsJSON, rowID, chatJID, callID, eventType)
+	return err
 }
 
 type ListCallEventsParams struct {
@@ -162,17 +186,22 @@ type DeleteCallEventsParams struct {
 }
 
 func (d *DB) DeleteCallEvents(p DeleteCallEventsParams) (int64, error) {
+	return d.DeleteCallEventsTarget(storeCtx(), d.sql, CallEventsTable, p)
+}
+
+// DeleteCallEventsTarget applies the call-log delete to the target table.
+func (d *DB) DeleteCallEventsTarget(ctx context.Context, ex QueryExecer, table string, p DeleteCallEventsParams) (int64, error) {
 	chatJID := strings.TrimSpace(p.ChatJID)
 	if chatJID == "" {
 		return 0, fmt.Errorf("chat JID is required")
 	}
-	query := "DELETE FROM call_events WHERE chat_jid = ? AND event_type = 'call_log'"
+	query := RetargetTable(callEventDeleteBaseSQL, CallEventsTable, table)
 	args := []any{chatJID}
 	if direction := strings.TrimSpace(p.Direction); direction != "" {
 		query += " AND direction = ?"
 		args = append(args, direction)
 	}
-	res, err := d.sql.Exec(query, args...)
+	res, err := ex.ExecContext(ctx, query, args...)
 	if err != nil {
 		return 0, err
 	}
